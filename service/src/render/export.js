@@ -32,7 +32,8 @@ const busy = new Set();
  *                           (rules.json playback), else the tail (retune.mjs)
  * @param opts.windowLength  null = the hook's own, else HOOK_WINDOW_S (hook-v4.mjs WINDOW_LEN)
  * @param opts.speed         null = the hook's own playback speed, else 1
- * @param opts.kind          "export" | "retune"
+ * @param opts.kind          "export" | "retune" | "mls"
+ *                           "mls" drops the hook and every overlay for a Bright-safe cut.
  */
 export async function exportReel(jobId, reelN, { windowStart = null, windowLength = null, speed = null, kind = "export" } = {}) {
   const lockKey = `${jobId}:${reelN}`;
@@ -91,29 +92,68 @@ async function exportInner(jobId, reelN, { windowStart, windowLength, speed, kin
     lockDoneS = hook.duration_s;
   }
 
+/** Timeline values are compared downstream at millisecond precision. */
+function round3(n) {
+  return Math.round(n * 1000) / 1000;
+}
+
   /* ------------------------------------------------------ effective recipe */
   const recipe = structuredClone(baseRecipe);
-  const hookSeg = recipe.segments.find((s) => s.kind === "hook") || recipe.segments[0];
-  const slot = hookSeg.tOut - hookSeg.tIn;
+
+  /* ---------------------------------------------------------- the MLS cut.
+     Bright bans superimposed text, graphics, logos and identifiable people on
+     MLS media, with a $250 fine for branded media. A reel carrying a hook and
+     captions is a social asset and must never reach a Bright virtual tour
+     field. The MLS cut drops the hook segment entirely and strips every
+     overlay from what is left, so the export is real photographs, camera
+     moves and music. No model is called: this is still free. */
+  const mlsCut = kind === "mls";
+  if (mlsCut) {
+    recipe.segments = recipe.segments.filter((s) => s.kind !== "hook");
+    if (recipe.segments.length === 0) {
+      throw Object.assign(
+        new Error("MLS cut has no segments left once the hook is removed"),
+        { status: 409 },
+      );
+    }
+    /* Rebase the timeline so the reel starts at zero after the hook is gone. */
+    const shift = recipe.segments[0].tIn;
+    for (const seg of recipe.segments) {
+      seg.tIn = round3(seg.tIn - shift);
+      seg.tOut = round3(seg.tOut - shift);
+      seg.overlays = []; // no captions, no disclosure, no CTA band, no branding
+    }
+    recipe.durationS = round3(recipe.segments[recipe.segments.length - 1].tOut);
+    recipe.narration = [];
+  }
+  /* The MLS cut has no hook segment, so none of the hook wiring applies and the
+     disclosure must not be re-added: there is nothing AI-generated left to
+     disclose, and any overlay at all would breach the Bright media rule. */
+  const hookSeg = mlsCut
+    ? null
+    : recipe.segments.find((s) => s.kind === "hook") || recipe.segments[0];
+  const slot = hookSeg ? hookSeg.tOut - hookSeg.tIn : 0;
   /* The hook slot comes from B7's beat grid; the clip comes from Veo. If the slot is
      shorter than the reveal, start the clip later so the truth lock still lands inside
      the slot, with a few frames of the untouched photo held before the cut. */
   const holdAfterLock = paid ? 0.1 : 0;
   const hookStartS = Math.max(0, lockDoneS + holdAfterLock - slot);
-  const reelLockAt = hookSeg.tIn + Math.max(0, lockAtS - hookStartS);
-  const reelLockDone = hookSeg.tIn + (lockDoneS - hookStartS);
+  const reelLockAt = hookSeg ? hookSeg.tIn + Math.max(0, lockAtS - hookStartS) : 0;
+  const reelLockDone = hookSeg ? hookSeg.tIn + (lockDoneS - hookStartS) : 0;
 
-  hookSeg.source = {
-    type: paid ? "generated" : "clip",
-    id: `hook:${reelN}:${hook.concept_id}`,
-    url: `/jobs/${jobId}/file/${tag}_hook.mp4`,
-  };
-  // B6 may have left an empty disclosure on the hook; it is replaced, never stacked.
-  hookSeg.overlays = hookSeg.overlays.filter((o) => o.kind !== "disclosure");
+  if (hookSeg) {
+    hookSeg.source = {
+      type: paid ? "generated" : "clip",
+      id: `hook:${reelN}:${hook.concept_id}`,
+      url: `/jobs/${jobId}/file/${tag}_hook.mp4`,
+    };
+    // B6 may have left an empty disclosure on the hook; it is replaced, never stacked.
+    hookSeg.overlays = hookSeg.overlays.filter((o) => o.kind !== "disclosure");
+  }
 
   const truth = job.nodes.B1?.payload;
   let disclosure = null;
-  if (paid) {
+  if (paid && !mlsCut) {
     disclosure = hookDisclosure({ market: truth.market, truth, truthLockS: reelLockDone });
     if (disclosure.problems.length) {
       throw Object.assign(new Error(`US_ALTERED_NO_DISCLOSURE: ${disclosure.problems.join("; ")}`), { status: 409 });
@@ -139,7 +179,11 @@ async function exportInner(jobId, reelN, { windowStart, windowLength, speed, kin
   const glides = [];
   const glidesMissing = [];
   const flags = jobFlags(job);
-  if (flags.interiorMotion === "veo") {
+  /* The MLS cut stays on untouched photographs with ffmpeg parallax. A Veo
+     glide is AI-generated motion and would require an on-frame disclosure,
+     which is itself a superimposed graphic and therefore banned on MLS media.
+     Dropping to 2.5d removes the dilemma instead of resolving it badly. */
+  if (flags.interiorMotion === "veo" && !mlsCut) {
     const clips = job.interior_clips || {};
     for (const seg of recipe.segments) {
       if (seg.kind !== "interior") continue;
