@@ -189,7 +189,68 @@ export async function runProduction(jobId) {
     }
   }
 
-  /* ---- exports */
+  /* ---- THE GATE.
+     Phase 1 ends here. Hooks and glides exist, the money is spent, and nothing
+     is assembled. The job now waits for a person to watch the hook clips and
+     choose one per reel.
+
+     This function has no code path to exportReel by design. Assembly is reached
+     only through assembleJob(), which requires a recorded selection. A job in
+     'awaiting_hook_selection' is not stalled, it is waiting, and any sweeper
+     that retries stuck work must skip it.
+
+     auto_assemble exists for an operator who genuinely wants the old
+     straight-through behaviour. It defaults false and is not surfaced. */
+  if (job.auto_assemble === true) {
+    emit(jobId, "gate", { skipped: true, reason: "auto_assemble" });
+    return assembleJob(jobId);
+  }
+
+  setStage(jobId, "awaiting_hook_selection", 0.94, { status: "awaiting_hook_selection" });
+  emit(jobId, "gate", {
+    reached: true,
+    reels: reels.length,
+    at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Phase 2. ffmpeg and Pillow only: no model is called, so this is free and may
+ * be re-run as often as the user likes.
+ *
+ * `selection` maps reel number to the hook the user picked. When it is absent
+ * the job keeps the hook each reel already holds, which is what a retune does.
+ */
+export async function assembleJob(jobId, selection = null) {
+  const issue = (step, reelN, err) => {
+    const message = String(err?.message ?? err).slice(0, 400);
+    emit(jobId, "run_issue", { step, reelN, message }, (job) => {
+      job.run_issues = [...(job.run_issues || []), { step, reel_n: reelN, message, at: new Date().toISOString() }];
+    });
+  };
+
+  const job = readJob(jobId);
+  if (job.status !== "awaiting_hook_selection" && job.auto_assemble !== true) {
+    throw Object.assign(
+      new Error(`assemble requires awaiting_hook_selection, job is ${job.status}`),
+      { status: 409 },
+    );
+  }
+
+  const reels = (job.nodes.B3?.payload?.reels || []).map((r) => r.reel_n);
+
+  /* Apply the human's choice before any export reads job.hooks. */
+  if (selection && Object.keys(selection).length > 0) {
+    emit(jobId, "selection", { selection }, (j) => {
+      j.hook_selection = selection;
+      for (const [reelN, conceptId] of Object.entries(selection)) {
+        const pool = j.hook_candidates?.[conceptId];
+        if (pool) j.hooks[reelN] = pool;
+      }
+    });
+  }
+
+  setStage(jobId, "assembling", 0.95, { status: "processing" });
   for (const reelN of reels) {
     setStage(jobId, `export:${reelN}`, 0.95 + 0.015 * reelN);
     try {

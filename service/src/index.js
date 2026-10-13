@@ -40,7 +40,7 @@ import {
   jobDir,
   emit,
 } from "./store.js";
-import { runJobDetached, resumeJob } from "./pipeline.js";
+import { runJobDetached, resumeJob, assembleJob } from "./pipeline.js";
 import { ledgerTotals } from "./ledger.js";
 import { ffmpegVersion, pythonStatus, fontStatus } from "./lib/media.js";
 import { vertexStatus } from "./lib/vertex.js";
@@ -501,6 +501,22 @@ app.post("/jobs/:id/reels/:reelN/export", async (req, res) => {
   try {
     const record = await exportReel(req.params.id, Number(req.params.reelN), { kind: "export" });
     res.json({ ok: true, version: record });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/**
+ * Phase 2. The only route that assembles, and it refuses a job that is not
+ * sitting at the gate. ffmpeg only, so it spends nothing and may be re-run.
+ *
+ * body: { selection?: { "1": "sketch_to_real", "2": "block_build", ... } }
+ */
+app.post("/jobs/:id/assemble", async (req, res) => {
+  const selection = (req.body && req.body.selection) || null;
+  try {
+    await assembleJob(req.params.id, selection);
+    res.json({ ok: true, jobId: req.params.id, cost_usd: 0 });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
   }
